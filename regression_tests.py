@@ -123,6 +123,34 @@ def test_reason_log_and_checklists() -> None:
     assert "일-에너지 체크리스트" in checklists
 
 
+def test_v4_highlight_and_fbd_helpers() -> None:
+    problem = "마찰 없는 원형 트랙에서 높이 h부터 출발한다."
+    cues = app.auto_detect_cues(problem, "")
+    spans = app.get_highlight_spans(problem, cues)
+    html = app.highlighted_problem_html(problem, cues)
+    assert spans, "단서 하이라이트 span이 있어야 한다."
+    assert "마찰 없는" in html, "부정 단서도 하이라이트되어야 한다."
+    assert cues["friction"] is False
+    assert cues["circular"] is True
+    expected = app.expected_fbd_items(cues)
+    assert "중력 mg" in expected
+    assert "수직항력 N" in expected
+
+
+def test_v4_learning_record_helpers() -> None:
+    diagnosis = app.build_diagnosis(
+        problem="마찰 있는 경사면에서 물체의 가속도를 구하라.",
+        solution="F=ma를 쓴다.",
+        goal="가속도",
+        user_method="뉴턴 제2법칙 F=ma",
+        manual_cues={key: False for key in app.CUE_LABELS},
+    )
+    record = app.make_record("문제", "풀이", "가속도", "뉴턴 제2법칙 F=ma", diagnosis, "메모")
+    assert record["recommended"] == "뉴턴 제2법칙 F=ma"
+    assert isinstance(record["missing_categories"], list)
+    assert app.categorize_issue("좌표축과 양의 방향을 정하라") == "좌표축"
+
+
 def test_constant_acceleration_consistency() -> None:
     valid, _, warnings = app.solve_constant_acceleration({"s": None, "u": 0, "v": None, "a": 2, "t": 3}, "v")
     assert valid == [6.0]
@@ -138,5 +166,7 @@ if __name__ == "__main__":
     test_negation_and_radius_context()
     test_distance_detection()
     test_reason_log_and_checklists()
+    test_v4_highlight_and_fbd_helpers()
+    test_v4_learning_record_helpers()
     test_constant_acceleration_consistency()
     print("OK: regression tests passed")
