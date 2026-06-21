@@ -1,5 +1,5 @@
 """
-동역학 풀이판단 훈련기 v3
+동역학 풀이판단 훈련기 v4
 =========================
 
 목표:
@@ -14,8 +14,12 @@
 
 from __future__ import annotations
 
+import html
+import json
 import math
 import re
+from collections import Counter
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -27,7 +31,7 @@ from sympy import Eq, Symbol, solve
 # 기본 설정
 # ============================================================
 st.set_page_config(
-    page_title="동역학 풀이판단 훈련기 v3",
+    page_title="동역학 풀이판단 훈련기 v4",
     page_icon="⚙️",
     layout="wide",
 )
@@ -785,6 +789,457 @@ def build_diagnosis(problem: str, solution: str, goal: str, user_method: str, ma
     )
 
 
+
+
+# ============================================================
+# v4 학습 UX 유틸: 단서 하이라이트 / FBD / 오답 기록
+# ============================================================
+HIGHLIGHT_STYLE = {
+    "time": "#FFE9A8",
+    "distance": "#D7F5FF",
+    "constant_accel": "#E8E0FF",
+    "projectile": "#DFF6DD",
+    "incline": "#FFE0D7",
+    "force": "#FFD6E7",
+    "mass": "#E6F3FF",
+    "tension": "#EDE7F6",
+    "friction": "#FFD1D1",
+    "frictionless": "#CDEFD6",
+    "height": "#FFF0C2",
+    "spring": "#D6FFF5",
+    "collision": "#FAD7FF",
+    "short_time": "#FAD7FF",
+    "circular": "#D7E9FF",
+    "rotation": "#E9FFD7",
+    "rolling": "#E9FFD7",
+    "torque": "#E4D7FF",
+    "unknown_force_path": "#FFEACC",
+}
+
+HIGHLIGHT_REGEX = {
+    "time": [r"비행\s*시간", r"\d+(?:\.\d+)?\s*초", r"시간", r"동안", r"time", r"\bt\s*="],
+    "distance": [r"\d+(?:\.\d+)?\s*(?:m|미터)\b", r"거리", r"변위", r"이동\s*거리", r"수평\s*거리", r"\bs\s*=", r"\bx\s*="],
+    "constant_accel": [r"등가속", r"가속도\s*일정", r"uniform\s+acceleration"],
+    "projectile": [r"포물선", r"발사", r"투사", r"던져", r"쏘아", r"projectile", r"launch"],
+    "incline": [r"경사면", r"빗면", r"inclined?\s+plane", r"incline"],
+    "force": [r"수직항력", r"외력", r"하중", r"힘", r"\d+(?:\.\d+)?\s*N\b", r"force"],
+    "mass": [r"질량", r"\d+(?:\.\d+)?\s*kg\b", r"\bm\s*="],
+    "tension": [r"장력", r"도르래", r"로프", r"줄", r"끈", r"pulley", r"tension"],
+    "friction": [r"마찰계수", r"운동마찰", r"정지마찰", r"거친", r"거칠", r"friction", r"μ", r"mu"],
+    "frictionless": [r"마찰\s*(?:이\s*)?(?:없는|없고|없이|무시|무시할)", r"frictionless", r"no\s+friction", r"without\s+friction"],
+    "height": [r"높이차", r"내려온\s*높이", r"올라간\s*높이", r"최고\s*높이", r"높이", r"고도", r"\bh\s*=", r"height"],
+    "spring": [r"스프링", r"용수철", r"탄성", r"spring", r"\bk\s*="],
+    "collision": [r"충돌", r"부딪", r"반발계수", r"충돌\s*후", r"collision", r"impact"],
+    "short_time": [r"충격량", r"짧은\s*시간", r"순간", r"타격", r"impulse"],
+    "circular": [r"원형\s*(?:트랙|고리|궤도)", r"원궤도", r"원운동", r"곡률반지름", r"구심", r"loop", r"circular\s+path"],
+    "rotation": [r"회전", r"각속도", r"각가속도", r"원판", r"원반", r"바퀴", r"원통", r"실린더", r"ω", r"α", r"omega", r"alpha"],
+    "rolling": [r"굴러", r"굴림", r"구름", r"미끄러지지\s*않", r"rolling"],
+    "torque": [r"토크", r"모멘트", r"관성모멘트", r"torque", r"moment", r"\bI\s*="],
+    "unknown_force_path": [r"위치에\s*따라", r"변하는\s*힘", r"힘-변위", r"F\(x\)", r"그래프"],
+}
+
+DISPLAY_CUE_NAME = {
+    **{key: value for key, value in CUE_LABELS.items()},
+    "frictionless": "마찰이 없다는 조건",
+}
+
+
+def get_highlight_spans(problem: str, cues: Dict[str, bool]) -> List[Tuple[int, int, str]]:
+    """문제 문장에서 앱이 근거로 삼은 표현의 위치를 찾는다."""
+    spans: List[Tuple[int, int, str]] = []
+    if not problem:
+        return spans
+    active_keys = [key for key, value in cues.items() if value]
+    # 부정 단서도 학습상 중요하므로 별도로 보여준다.
+    if has_negation(problem, "friction"):
+        active_keys.append("frictionless")
+    for key in active_keys:
+        for pattern in HIGHLIGHT_REGEX.get(key, []):
+            for match in re.finditer(pattern, problem, flags=re.IGNORECASE):
+                spans.append((match.start(), match.end(), key))
+    # 겹치는 span은 긴 것을 우선한다.
+    spans.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+    chosen: List[Tuple[int, int, str]] = []
+    last_end = -1
+    for start, end, key in spans:
+        if start >= last_end:
+            chosen.append((start, end, key))
+            last_end = end
+    return chosen
+
+
+def highlighted_problem_html(problem: str, cues: Dict[str, bool]) -> str:
+    spans = get_highlight_spans(problem, cues)
+    if not problem.strip():
+        return "<em>문제 문장을 입력하면 단서가 하이라이트돼.</em>"
+    if not spans:
+        return f"<div class='problem-box'>{html.escape(problem)}</div>"
+    parts: List[str] = []
+    pos = 0
+    for start, end, key in spans:
+        parts.append(html.escape(problem[pos:start]))
+        color = HIGHLIGHT_STYLE.get(key, "#FFF3B0")
+        title = DISPLAY_CUE_NAME.get(key, key)
+        parts.append(
+            f"<span title='{html.escape(title)}' style='background:{color}; color:#111; padding:0.08rem 0.18rem; border-radius:0.25rem; font-weight:700;'>"
+            f"{html.escape(problem[start:end])}</span>"
+        )
+        pos = end
+    parts.append(html.escape(problem[pos:]))
+    return "<div class='problem-box'>" + "".join(parts).replace("\n", "<br>") + "</div>"
+
+
+def render_highlighted_problem(problem: str, cues: Dict[str, bool]) -> None:
+    st.markdown(
+        """
+        <style>
+        .problem-box {
+            border: 1px solid rgba(128,128,128,0.35);
+            border-radius: 0.7rem;
+            padding: 0.9rem;
+            line-height: 1.85;
+            font-size: 1rem;
+            background: rgba(128,128,128,0.08);
+        }
+        .small-pill {
+            display:inline-block; padding:0.15rem 0.45rem; margin:0.1rem;
+            border-radius:999px; background:rgba(128,128,128,0.14); font-size:0.85rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(highlighted_problem_html(problem, cues), unsafe_allow_html=True)
+    spans = get_highlight_spans(problem, cues)
+    if spans:
+        labels = []
+        for _, _, key in spans:
+            label = DISPLAY_CUE_NAME.get(key, key)
+            if label not in labels:
+                labels.append(label)
+        st.markdown("".join([f"<span class='small-pill'>{html.escape(label)}</span>" for label in labels]), unsafe_allow_html=True)
+    else:
+        st.caption("아직 하이라이트할 핵심 단서가 적어. 문제 조건을 조금 더 구체적으로 써봐.")
+
+
+def expected_fbd_items(cues: Dict[str, bool]) -> List[str]:
+    """단서에 따라 FBD에 들어갈 가능성이 큰 항목을 안내한다."""
+    items: List[str] = ["중력 mg"]
+    if cues.get("incline") or cues.get("friction") or cues.get("circular") or cues.get("force"):
+        items.append("수직항력 N")
+    if cues.get("tension"):
+        items.append("장력 T")
+    if cues.get("friction"):
+        items.append("마찰력 f")
+    if cues.get("spring"):
+        items.append("스프링 힘 kx")
+    if cues.get("circular"):
+        items.append("반지름 중심 방향 표시")
+    if cues.get("incline"):
+        items.append("경사면 방향 좌표축")
+        items.append("mg sinθ / mg cosθ 분해")
+    if cues.get("rotation") or cues.get("rolling") or cues.get("torque"):
+        items.append("토크 방향 또는 회전 방향")
+    return list(dict.fromkeys(items))
+
+
+def render_fbd_canvas(problem: str, cues: Dict[str, bool], key_prefix: str = "fbd") -> None:
+    st.subheader("FBD 스케치 훈련")
+    st.caption("그림 위에 힘의 방향을 그려보고, 아래 체크로 빠진 힘을 점검해. 폰에서는 손가락으로도 그릴 수 있어.")
+    expected = expected_fbd_items(cues)
+    if expected:
+        st.markdown("**이 문제에서 FBD에 들어갈 가능성이 큰 요소**")
+        st.write(" / ".join(expected))
+
+    uploaded = st.file_uploader("문제 그림 또는 네가 그린 그림 업로드", type=["png", "jpg", "jpeg"], key=f"{key_prefix}_upload")
+    stroke_width = st.slider("화살표/선 두께", 1, 10, 3, key=f"{key_prefix}_stroke")
+    drawing_mode = st.selectbox("그리기 모드", ["line", "freedraw", "transform", "rect", "circle"], index=0, key=f"{key_prefix}_mode")
+
+    try:
+        from streamlit_drawable_canvas import st_canvas
+        from PIL import Image
+    except Exception:
+        st.info("FBD 직접 그리기를 쓰려면 requirements.txt에 streamlit-drawable-canvas와 pillow가 있어야 해. 이번 v4에는 포함해뒀어.")
+        return
+
+    background_image = None
+    canvas_width = 620
+    canvas_height = 420
+    if uploaded is not None:
+        try:
+            img = Image.open(uploaded).convert("RGBA")
+            ratio = min(canvas_width / img.width, canvas_height / img.height)
+            new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
+            background_image = img.resize(new_size)
+            canvas_width, canvas_height = new_size
+        except Exception:
+            st.warning("이미지를 읽지 못했어. 빈 캔버스로 열게.")
+
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 0, 0, 0.15)",
+        stroke_width=stroke_width,
+        stroke_color="#E03131",
+        background_color="#FFFFFF",
+        background_image=background_image,
+        update_streamlit=True,
+        height=canvas_height,
+        width=canvas_width,
+        drawing_mode=drawing_mode,
+        key=f"{key_prefix}_canvas",
+    )
+
+    st.markdown("**내 FBD 점검**")
+    checked = []
+    cols = st.columns(2)
+    for idx, item in enumerate(expected):
+        with cols[idx % 2]:
+            if st.checkbox(item, key=f"{key_prefix}_fbd_item_{idx}"):
+                checked.append(item)
+    missing = [item for item in expected if item not in checked]
+    if checked:
+        st.success("표시했다고 체크한 항목: " + " / ".join(checked))
+    if missing:
+        st.warning("아직 점검이 필요한 항목: " + " / ".join(missing))
+    else:
+        st.success("기본 FBD 체크 항목은 모두 확인했어. 이제 방향/부호가 맞는지 식과 연결해봐.")
+
+    if canvas_result.json_data:
+        objects = canvas_result.json_data.get("objects", [])
+        st.caption(f"캔버스에 표시된 도형 수: {len(objects)}개")
+
+
+def init_wizard_state() -> None:
+    st.session_state.setdefault("wizard_step", 0)
+    st.session_state.setdefault("wizard_data", {})
+
+
+def wizard_next(max_step: int) -> None:
+    st.session_state["wizard_step"] = min(max_step, st.session_state.get("wizard_step", 0) + 1)
+
+
+def wizard_prev() -> None:
+    st.session_state["wizard_step"] = max(0, st.session_state.get("wizard_step", 0) - 1)
+
+
+def wizard_progress_labels() -> List[str]:
+    return ["문제", "구할 값", "물체/FBD", "좌표축", "원리", "식/단위", "진단"]
+
+
+def render_wizard_tab(use_ai: bool, model: str, api_key: str) -> None:
+    init_wizard_state()
+    labels = wizard_progress_labels()
+    max_step = len(labels) - 1
+    step = st.session_state["wizard_step"]
+    data = st.session_state["wizard_data"]
+
+    st.header("마법사형 단계별 진단")
+    st.caption("한 번에 다 생각하지 않고, 문제풀이 사고 과정을 한 단계씩 통과하는 모드야.")
+    st.progress((step + 1) / len(labels))
+    st.markdown(" → ".join([f"**{name}**" if i == step else name for i, name in enumerate(labels)]))
+
+    if step == 0:
+        data["problem"] = st.text_area(
+            "1단계: 문제를 그대로 입력해줘",
+            value=data.get("problem", "질량 m인 물체가 마찰 없는 곡면을 따라 높이 h에서 출발해 반지름 R인 원형 트랙을 지난다. 꼭대기에서 떨어지지 않기 위한 최소 높이를 구하라."),
+            height=150,
+        )
+        auto = auto_detect_cues(data.get("problem", ""), "")
+        st.markdown("#### 단서 하이라이트 미리보기")
+        render_highlighted_problem(data.get("problem", ""), auto)
+        st.button("다음: 구하려는 값", type="primary", on_click=wizard_next, args=(max_step,))
+
+    elif step == 1:
+        data["goal"] = st.selectbox("2단계: 이 문제에서 구하려는 값은?", GOALS, index=GOALS.index(data.get("goal", "접촉 유지 조건")) if data.get("goal") in GOALS else 0)
+        data["goal_reason"] = st.text_input("왜 그렇게 생각했어?", value=data.get("goal_reason", ""))
+        c1, c2 = st.columns(2)
+        c1.button("이전", on_click=wizard_prev)
+        c2.button("다음: 물체/FBD", type="primary", on_click=wizard_next, args=(max_step,))
+
+    elif step == 2:
+        data["body"] = st.text_input("3단계: 어떤 물체를 분리해서 볼 거야?", value=data.get("body", "물체 하나"))
+        problem = data.get("problem", "")
+        cues = auto_detect_cues(problem, "")
+        st.markdown("#### FBD 기본 점검")
+        render_fbd_canvas(problem, cues, key_prefix="wizard")
+        data["fbd_note"] = st.text_area("FBD에서 표시한 힘을 글로도 적어봐", value=data.get("fbd_note", ""), height=80)
+        c1, c2 = st.columns(2)
+        c1.button("이전", on_click=wizard_prev)
+        c2.button("다음: 좌표축", type="primary", on_click=wizard_next, args=(max_step,))
+
+    elif step == 3:
+        data["axis"] = st.text_area("4단계: 좌표축, 양의 방향, 기준 높이를 정해봐", value=data.get("axis", ""), height=110)
+        st.info("예: 경사면 아래 방향을 +로 둔다 / 반지름 중심 방향을 +로 둔다 / 바닥을 위치에너지 0으로 둔다")
+        c1, c2 = st.columns(2)
+        c1.button("이전", on_click=wizard_prev)
+        c2.button("다음: 사용할 원리", type="primary", on_click=wizard_next, args=(max_step,))
+
+    elif step == 4:
+        data["user_method"] = st.selectbox("5단계: 먼저 쓸 풀이법은?", METHODS, index=METHODS.index(data.get("user_method", "일-에너지 원리")) if data.get("user_method") in METHODS else 0)
+        data["method_reason"] = st.text_area("왜 그 원리를 골랐어?", value=data.get("method_reason", ""), height=100)
+        c1, c2 = st.columns(2)
+        c1.button("이전", on_click=wizard_prev)
+        c2.button("다음: 식과 단위", type="primary", on_click=wizard_next, args=(max_step,))
+
+    elif step == 5:
+        data["equations"] = st.text_area("6단계: 세운 식을 적어봐", value=data.get("equations", ""), height=120)
+        data["units"] = st.text_input("답의 단위와 물리적 의미 확인", value=data.get("units", ""))
+        c1, c2 = st.columns(2)
+        c1.button("이전", on_click=wizard_prev)
+        c2.button("진단 보기", type="primary", on_click=wizard_next, args=(max_step,))
+
+    else:
+        problem = data.get("problem", "")
+        solution = build_step_solution_text(
+            "",
+            {
+                "구하려는 값": data.get("goal_reason", ""),
+                "볼 물체": data.get("body", ""),
+                "FBD": data.get("fbd_note", ""),
+                "좌표축/기준": data.get("axis", ""),
+                "사용할 원리": data.get("method_reason", ""),
+                "세운 식": data.get("equations", ""),
+                "단위 확인": data.get("units", ""),
+            },
+        )
+        goal = data.get("goal", "아직 모르겠음")
+        user_method = data.get("user_method", METHODS[0])
+        manual = {key: False for key in CUE_LABELS}
+        diagnosis = build_diagnosis(problem, solution, goal, user_method, manual)
+        render_highlighted_problem(problem, diagnosis.detected_cues)
+        show_diagnosis(diagnosis)
+        render_save_record_button("wizard", problem, solution, goal, user_method, diagnosis)
+        if use_ai:
+            st.subheader("11. 선택적 AI 튜터 피드백")
+            with st.spinner("AI 피드백 생성 중..."):
+                ai_text = optional_ai_feedback(api_key, model, problem, solution, diagnosis)
+            st.markdown(ai_text or "API 키가 없어서 AI 피드백은 생략했어.")
+        c1, c2 = st.columns(2)
+        c1.button("이전", on_click=wizard_prev)
+        if c2.button("새 문제로 처음부터"):
+            st.session_state["wizard_step"] = 0
+            st.session_state["wizard_data"] = {}
+            st.rerun()
+
+
+def categorize_issue(text: str) -> str:
+    rules = [
+        ("좌표축", ["좌표", "방향", "부호", "축"]),
+        ("FBD/힘 누락", ["자유물체도", "fbd", "힘", "장력", "마찰", "수직항력"]),
+        ("에너지 조건", ["에너지", "마찰이 한 일", "스프링", "높이"]),
+        ("운동량/충돌", ["충돌", "운동량", "반발"]),
+        ("원운동 조건", ["원운동", "반지름", "mv²", "mv^2", "접촉"]),
+        ("강체/회전", ["회전", "강체", "관성모멘트", "토크", "구름"]),
+        ("단위 확인", ["단위"]),
+        ("포물선 성분분해", ["포물선", "vx", "vy", "수평", "수직"]),
+    ]
+    lowered = text.lower()
+    for label, words in rules:
+        if any(word.lower() in lowered for word in words):
+            return label
+    return "기타"
+
+
+def ensure_records() -> None:
+    st.session_state.setdefault("study_records", [])
+
+
+def make_record(problem: str, solution: str, goal: str, user_method: str, diagnosis: Diagnosis, memo: str = "") -> Dict[str, object]:
+    missing_categories = [categorize_issue(item) for item in diagnosis.missing_elements]
+    misconception_names = [name for name, _ in diagnosis.misconception_hits]
+    return {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "problem": problem,
+        "solution": solution,
+        "goal": goal,
+        "user_method": user_method,
+        "recommended": diagnosis.recommendation.primary,
+        "combined": diagnosis.recommendation.combined_methods,
+        "missing": diagnosis.missing_elements,
+        "missing_categories": missing_categories,
+        "misconceptions": misconception_names,
+        "memo": memo,
+        "confidence": diagnosis.confidence,
+    }
+
+
+def render_save_record_button(prefix: str, problem: str, solution: str, goal: str, user_method: str, diagnosis: Diagnosis) -> None:
+    ensure_records()
+    with st.expander("오답노트/학습기록에 저장", expanded=False):
+        memo = st.text_area("짧은 메모", value="", key=f"{prefix}_record_memo", height=80)
+        if st.button("현재 진단 저장", key=f"{prefix}_save_record"):
+            st.session_state["study_records"].append(make_record(problem, solution, goal, user_method, diagnosis, memo))
+            st.success("저장했어. '학습 기록' 탭에서 취약점 그래프를 볼 수 있어.")
+
+
+def render_counter_chart(title: str, counter: Counter) -> None:
+    st.markdown(f"#### {title}")
+    if not counter:
+        st.caption("아직 데이터가 부족해.")
+        return
+    chart_data = [{"항목": key, "횟수": value} for key, value in counter.items()]
+    st.bar_chart(chart_data, x="항목", y="횟수")
+    top_label, top_count = counter.most_common(1)[0]
+    st.info(f"가장 자주 나온 항목은 **{top_label}**이고, 지금까지 {top_count}번 기록됐어.")
+
+
+def render_study_records_tab() -> None:
+    ensure_records()
+    st.header("학습 기록과 취약점 시각화")
+    records: List[Dict[str, object]] = st.session_state["study_records"]
+    st.caption("현재 버전은 브라우저 세션 기준 저장이야. 앱을 새로고침하거나 서버가 재시작되면 사라질 수 있으니 필요하면 JSON으로 다운로드해.")
+
+    uploaded = st.file_uploader("이전에 내려받은 학습기록 JSON 불러오기", type=["json"], key="records_upload")
+    if uploaded is not None:
+        try:
+            loaded = json.loads(uploaded.getvalue().decode("utf-8"))
+            if isinstance(loaded, list):
+                st.session_state["study_records"] = loaded
+                records = st.session_state["study_records"]
+                st.success("학습기록을 불러왔어.")
+        except Exception as exc:
+            st.warning(f"불러오기에 실패했어: {exc}")
+
+    if not records:
+        st.info("아직 저장된 진단이 없어. 마법사 진단이나 전체 입력 진단에서 '현재 진단 저장'을 눌러봐.")
+        return
+
+    st.metric("저장된 진단 수", len(records))
+    method_counter = Counter(str(r.get("recommended", "기타")) for r in records)
+    issue_counter = Counter(cat for r in records for cat in r.get("missing_categories", []))
+    misconception_counter = Counter(name for r in records for name in r.get("misconceptions", []))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        render_counter_chart("추천 풀이법 분포", method_counter)
+    with c2:
+        render_counter_chart("자주 빠지는 요소", issue_counter)
+    render_counter_chart("자주 걸리는 오개념", misconception_counter)
+
+    st.markdown("#### 기록 목록")
+    for idx, record in enumerate(reversed(records), start=1):
+        with st.expander(f"{idx}. {record.get('time')} · 추천: {record.get('recommended')}"):
+            st.write("**문제**")
+            st.write(record.get("problem", ""))
+            st.write("**내 풀이/단계 입력**")
+            st.write(record.get("solution", ""))
+            st.write("**빠진 요소**")
+            for item in record.get("missing", []):
+                st.warning(item)
+            if record.get("memo"):
+                st.write("**메모**")
+                st.write(record.get("memo"))
+
+    st.download_button(
+        "학습기록 JSON 다운로드",
+        data=json.dumps(records, ensure_ascii=False, indent=2),
+        file_name="dynamics_study_records.json",
+        mime="application/json",
+    )
+    if st.button("세션 학습기록 모두 지우기"):
+        st.session_state["study_records"] = []
+        st.rerun()
+
+
 # ============================================================
 # 선택적 AI 피드백
 # ============================================================
@@ -957,8 +1412,8 @@ def collision_1d(m1: float, u1: float, m2: float, u2: float, e: float) -> Tuple[
 # UI 렌더링
 # ============================================================
 def render_header():
-    st.title("⚙️ 동역학 풀이판단 훈련기 v3")
-    st.caption("문제와 네 풀이를 입력하면, 어떤 풀이법이 맞는지와 무엇이 빠졌는지 진단하는 튜터형 앱")
+    st.title("⚙️ 동역학 풀이판단 훈련기 v4")
+    st.caption("단계별 마법사, 단서 하이라이트, FBD 스케치, 학습 기록까지 포함한 동역학 튜터형 앱")
     with st.expander("이 앱의 핵심 역할", expanded=True):
         st.markdown(
             """
@@ -979,6 +1434,12 @@ def render_header():
             - 판단 이유 로그
             - 문제 유형별 필수 체크리스트
             - 회귀 테스트 케이스 확장
+
+            v4에서 추가된 점:
+            - 한 화면에 한 단계만 보이는 마법사형 진단 UI
+            - 문제 문장 단서 하이라이트
+            - FBD 캔버스 스케치와 힘 체크
+            - 세션 기반 오답노트 저장과 취약점 그래프
             """
         )
 
@@ -1145,9 +1606,17 @@ def render_diagnosis_tab(use_ai: bool, model: str, api_key: str):
 
     manual = cue_checkboxes(prefix="diag")
 
+    preview_cues = merge_cues(auto_detect_cues(problem, solution_for_diagnosis), manual)
+    st.subheader("문제 단서 하이라이트")
+    render_highlighted_problem(problem, preview_cues)
+
+    with st.expander("FBD 스케치/점검 열기", expanded=False):
+        render_fbd_canvas(problem, preview_cues, key_prefix="diag")
+
     if st.button("진단 실행", type="primary"):
         diagnosis = build_diagnosis(problem, solution_for_diagnosis, goal, user_method, manual)
         show_diagnosis(diagnosis)
+        render_save_record_button("diag", problem, solution_for_diagnosis, goal, user_method, diagnosis)
 
         if use_ai:
             st.subheader("11. 선택적 AI 튜터 피드백")
@@ -1175,10 +1644,14 @@ def render_training_tab():
     goal = st.selectbox("구하려는 값", GOALS, index=GOALS.index("속도"), key="train_goal")
     user_method = st.radio("먼저 떠올린 풀이법", METHODS, horizontal=True, key="train_method")
     manual = cue_checkboxes(prefix="train")
+    preview_cues = merge_cues(auto_detect_cues(problem, ""), manual)
+    st.subheader("문제 단서 하이라이트")
+    render_highlighted_problem(problem, preview_cues)
 
     if st.button("판단만 확인", type="primary"):
         diagnosis = build_diagnosis(problem, "", goal, user_method, manual)
         show_diagnosis(diagnosis)
+        render_save_record_button("train", problem, "", goal, user_method, diagnosis)
 
 
 def render_calculator_tab():
@@ -1316,7 +1789,7 @@ def render_prompt_tab():
     st.header("바이브코딩 확장 프롬프트")
     st.write("이 앱을 더 발전시키고 싶을 때 아래 프롬프트를 복사해서 쓰면 돼.")
     prompt = """
-동역학 풀이판단 훈련기 v3를 개선하고 싶다.
+동역학 풀이판단 훈련기 v4를 개선하고 싶다.
 현재 앱은 Streamlit으로 작성되어 있고, 문제 문장과 학생 풀이를 입력받아 규칙 기반으로 풀이법을 추천한다.
 다음 기능을 추가해줘.
 
@@ -1341,16 +1814,20 @@ def render_prompt_tab():
 def main():
     render_header()
     use_ai, model, api_key = render_sidebar()
-    tabs = st.tabs(["v3 풀이 진단", "풀이법 훈련", "계산 도우미", "오개념 노트", "확장 프롬프트"])
+    tabs = st.tabs(["마법사 진단", "전체 입력 진단", "풀이법 훈련", "계산 도우미", "오개념 노트", "학습 기록", "확장 프롬프트"])
     with tabs[0]:
-        render_diagnosis_tab(use_ai, model, api_key)
+        render_wizard_tab(use_ai, model, api_key)
     with tabs[1]:
-        render_training_tab()
+        render_diagnosis_tab(use_ai, model, api_key)
     with tabs[2]:
-        render_calculator_tab()
+        render_training_tab()
     with tabs[3]:
-        render_misconception_tab()
+        render_calculator_tab()
     with tabs[4]:
+        render_misconception_tab()
+    with tabs[5]:
+        render_study_records_tab()
+    with tabs[6]:
         render_prompt_tab()
 
 
